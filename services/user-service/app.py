@@ -9,7 +9,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ----------- Prometheus Metrics -----------
+
 REQUEST_COUNT = Counter(
     'user_service_requests_total',
     'Total HTTP requests',
@@ -21,7 +21,7 @@ REQUEST_LATENCY = Histogram(
     ['endpoint']
 )
 
-# ----------- Fake In-Memory Data -----------
+
 USERS = {
     "1": {"id": "1", "name": "Alice", "email": "alice@example.com", "role": "admin"},
     "2": {"id": "2", "name": "Bob",   "email": "bob@example.com",   "role": "user"},
@@ -30,7 +30,7 @@ USERS = {
 
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:5001")
 
-# ----------- Routes -----------
+
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy", "service": "user-service"})
@@ -50,7 +50,6 @@ def get_user(user_id):
         logger.warning(f"User not found: user_id={user_id}")
         return jsonify({"error": "User not found"}), 404
 
-    # Call order-service
     orders = []
     try:
         resp = requests.get(f"{ORDER_SERVICE_URL}/orders/{user_id}", timeout=3)
