@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  user-service:
+    build: ./services/user-service
+    ports:
+      - "5001:5001"
+    environment:
+      - ORDER_SERVICE_URL=http://order-service:5001
+    depends_on:
+      - order-service
+
+  order-service:
+    build: ./services/order-service
+    ports:
+      - "5002:5002"
+    environment:
+      - NOTIF_SERVICE_URL=http://notification-service:5002
+    depends_on:
+      - notification-service
+
+  notification-service:
+    build: ./services/notification-service
+    ports:
+      - "5003:5003"

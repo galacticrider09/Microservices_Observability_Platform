@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+
+  # ── Application Services ────────────────────────────────────────
+  user-service:
+    build: ./services/user-service
+    ports:
+      - "5001:5001"
+    environment:
+      - ORDER_SERVICE_URL=http://order-service:5001
+    depends_on:
+      - order-service
+    logging:
+      driver: json-file
+
+  order-service:
+    build: ./services/order-service
+    ports:
+      - "5002:5002"
+    environment:
+      - NOTIF_SERVICE_URL=http://notification-service:5002
+    depends_on:
+      - notification-service
+    logging:
+      driver: json-file
+
+  notification-service:
+    build: ./services/notification-service
+    ports:
+      - "5003:5003"
+    logging:
+      driver: json-file
+
+  # ── Observability Stack ─────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.enable-lifecycle'
+
+  loki:
+    image: grafana/loki:2.9.0
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    volumes:
+      - ./monitoring/promtail.yml:/etc/promtail/config.yml
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    depends_on:
+      - prometheus
+      - loki
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+
+volumes:
+  grafana-data:
