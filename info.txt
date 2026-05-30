@@ -1,0 +1,926 @@
+# Microservices Observability Platform — Complete Build Guide
+
+> **Goal:** Build 3 tiny microservices and wrap them with a full observability stack  
+> (metrics, logs, alerts). The app is simple. The infrastructure around it is the point.
+
+---
+
+## Prerequisites — Install These First
+
+| Tool | Why | Install |
+|---|---|---|
+| Python 3.11+ | To write the services | python.org |
+| Docker Desktop | To containerize everything | docker.com |
+| minikube | Local Kubernetes cluster | minikube.sigs.k8s.io |
+| kubectl | Talk to Kubernetes | via Docker Desktop or brew |
+| Helm | Package manager for Kubernetes | helm.sh |
+| k6 | Load testing tool | k6.io |
+| Git + GitHub account | Source control + CI/CD | github.com |
+| DockerHub account | Store Docker images | hub.docker.com |
+| Slack workspace | For receiving alerts | slack.com |
+
+---
+
+## Project Folder Structure
+
+Create this structure from the start. Everything has a home.
+
+```
+observability-platform/
+├── services/
+│   ├── user-service/
+│   │   ├── app.py
+│   │   ├── requirements.txt
+│   │   └── Dockerfile
+│   ├── order-service/
+│   │   ├── app.py
+│   │   ├── requirements.txt
+│   │   └── Dockerfile
+│   └── notification-service/
+│       ├── app.py
+│       ├── requirements.txt
+│       └── Dockerfile
+├── k8s/
+│   ├── user-service.yaml
+│   ├── order-service.yaml
+│   ├── notification-service.yaml
+│   └── monitoring/
+│       ├── prometheus-values.yaml
+│       ├── loki-values.yaml
+│       └── grafana-values.yaml
+├── monitoring/
+│   ├── prometheus.yml
+│   ├── alert-rules.yml
+│   ├── alertmanager.yml
+│   ├── promtail.yml
+│   └── grafana/
+│       └── datasources.yml
+├── tests/
+│   └── load-test.js
+├── .github/
+│   └── workflows/
+│       └── deploy.yml
+└── docker-compose.yml
+```
+
+---
+
+## Phase 1 — Build the 3 Microservices
+
+These services are intentionally simple. Focus on the structure, not the logic.
+
+### Service Architecture
+
+```
+User hits → user-service (port 5000)
+                ↓ calls
+           order-service (port 5001)   ← has a 20% random failure rate (intentional villain)
+                ↓ calls
+        notification-service (port 5002)
+```
+
+---
+
+### user-service/requirements.txt
+```
+flask==3.0.0
+prometheus-client==0.19.0
+requests==2.31.0
+```
+
+### user-service/app.py
+```python
+from flask import Flask, jsonify
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import time, requests, logging, os
+
+app = Flask(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s [user-service] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ----------- Prometheus Metrics -----------
+REQUEST_COUNT = Counter(
+    'user_service_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status_code']
+)
+REQUEST_LATENCY = Histogram(
+    'user_service_request_duration_seconds',
+    'Request latency in seconds',
+    ['endpoint']
+)
+
+# ----------- Fake In-Memory Data -----------
+USERS = {
+    "1": {"id": "1", "name": "Alice", "email": "alice@example.com", "role": "admin"},
+    "2": {"id": "2", "name": "Bob",   "email": "bob@example.com",   "role": "user"},
+    "3": {"id": "3", "name": "Charlie","email": "charlie@example.com","role": "user"},
+}
+
+ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:5001")
+
+# ----------- Routes -----------
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "service": "user-service"})
+
+@app.route('/metrics')
+def metrics():
+    return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+
+@app.route('/users/<user_id>')
+def get_user(user_id):
+    start = time.time()
+    logger.info(f"Request received for user_id={user_id}")
+
+    if user_id not in USERS:
+        REQUEST_COUNT.labels('GET', '/users', '404').inc()
+        REQUEST_LATENCY.labels('/users').observe(time.time() - start)
+        logger.warning(f"User not found: user_id={user_id}")
+        return jsonify({"error": "User not found"}), 404
+
+    # Call order-service
+    orders = []
+    try:
+        resp = requests.get(f"{ORDER_SERVICE_URL}/orders/{user_id}", timeout=3)
+        if resp.status_code == 200:
+            orders = resp.json()
+        else:
+            logger.warning(f"order-service returned {resp.status_code} for user {user_id}")
+    except Exception as e:
+        logger.warning(f"Could not reach order-service: {e}")
+
+    user = {**USERS[user_id], "orders": orders}
+    REQUEST_COUNT.labels('GET', '/users', '200').inc()
+    REQUEST_LATENCY.labels('/users').observe(time.time() - start)
+    logger.info(f"Successfully returned user_id={user_id} with {len(orders)} orders")
+    return jsonify(user)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
+```
+
+---
+
+### order-service/requirements.txt
+```
+flask==3.0.0
+prometheus-client==0.19.0
+requests==2.31.0
+```
+
+### order-service/app.py
+```python
+from flask import Flask, jsonify
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import time, random, requests, logging, os
+
+app = Flask(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s [order-service] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ----------- Prometheus Metrics -----------
+REQUEST_COUNT = Counter(
+    'order_service_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status_code']
+)
+REQUEST_LATENCY = Histogram(
+    'order_service_request_duration_seconds',
+    'Request latency in seconds',
+    ['endpoint']
+)
+ERROR_COUNTER = Counter(
+    'order_service_errors_total',
+    'Total errors in order-service'
+)
+
+ORDERS = {
+    "1": [{"id": "101", "item": "Laptop",  "amount": 999.99, "status": "delivered"}],
+    "2": [{"id": "102", "item": "Phone",   "amount": 499.99, "status": "shipped"}],
+    "3": [{"id": "103", "item": "Tablet",  "amount": 299.99, "status": "processing"}],
+}
+
+NOTIF_SERVICE_URL = os.getenv("NOTIF_SERVICE_URL", "http://notification-service:5002")
+
+# ----------- Routes -----------
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "service": "order-service"})
+
+@app.route('/metrics')
+def metrics():
+    return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+
+@app.route('/orders/<user_id>')
+def get_orders(user_id):
+    start = time.time()
+    logger.info(f"Fetching orders for user_id={user_id}")
+
+    # ⚡ THE VILLAIN — 20% intentional failure rate
+    # This is what Prometheus will catch and alert on
+    if random.random() < 0.2:
+        ERROR_COUNTER.inc()
+        REQUEST_COUNT.labels('GET', '/orders', '500').inc()
+        REQUEST_LATENCY.labels('/orders').observe(time.time() - start)
+        logger.error(f"DB_TIMEOUT: Failed to fetch orders for user_id={user_id} — simulated database timeout")
+        return jsonify({"error": "Database timeout — please retry"}), 500
+
+    # Simulate realistic DB query time
+    time.sleep(random.uniform(0.05, 0.3))
+
+    orders = ORDERS.get(user_id, [])
+
+    # Fire-and-forget notification
+    try:
+        requests.post(
+            f"{NOTIF_SERVICE_URL}/notify",
+            json={"user_id": user_id, "event": "order_viewed"},
+            timeout=1
+        )
+    except Exception as e:
+        logger.warning(f"Notification failed (non-critical): {e}")
+
+    REQUEST_COUNT.labels('GET', '/orders', '200').inc()
+    REQUEST_LATENCY.labels('/orders').observe(time.time() - start)
+    logger.info(f"Returned {len(orders)} orders for user_id={user_id}")
+    return jsonify(orders)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5001, debug=False)
+```
+
+---
+
+### notification-service/requirements.txt
+```
+flask==3.0.0
+prometheus-client==0.19.0
+```
+
+### notification-service/app.py
+```python
+from flask import Flask, jsonify, request
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+import logging
+
+app = Flask(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s [notification-service] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+NOTIFICATION_COUNT = Counter(
+    'notification_service_sent_total',
+    'Total notifications dispatched',
+    ['event_type']
+)
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "service": "notification-service"})
+
+@app.route('/metrics')
+def metrics():
+    return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+
+@app.route('/notify', methods=['POST'])
+def notify():
+    data = request.get_json() or {}
+    user_id  = data.get('user_id',  'unknown')
+    event    = data.get('event',    'unknown')
+
+    logger.info(f"Notification dispatched: user_id={user_id} event={event}")
+    NOTIFICATION_COUNT.labels(event).inc()
+    return jsonify({"status": "sent", "user_id": user_id, "event": event})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5002, debug=False)
+```
+
+---
+
+### Dockerfile (same for all 3 services — only EXPOSE port changes)
+
+**user-service/Dockerfile**
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 5000
+CMD ["python", "app.py"]
+```
+
+**order-service/Dockerfile** — same but `EXPOSE 5001`
+
+**notification-service/Dockerfile** — same but `EXPOSE 5002`
+
+---
+
+## Phase 2 — Run Locally with Docker Compose
+
+Before touching Kubernetes, confirm everything works locally.
+
+### docker-compose.yml
+```yaml
+version: '3.8'
+
+services:
+
+  # ── Application Services ────────────────────────────────────────
+  user-service:
+    build: ./services/user-service
+    ports:
+      - "5000:5000"
+    environment:
+      - ORDER_SERVICE_URL=http://order-service:5001
+    depends_on:
+      - order-service
+    logging:
+      driver: json-file
+
+  order-service:
+    build: ./services/order-service
+    ports:
+      - "5001:5001"
+    environment:
+      - NOTIF_SERVICE_URL=http://notification-service:5002
+    depends_on:
+      - notification-service
+    logging:
+      driver: json-file
+
+  notification-service:
+    build: ./services/notification-service
+    ports:
+      - "5002:5002"
+    logging:
+      driver: json-file
+
+  # ── Observability Stack ─────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.enable-lifecycle'
+
+  loki:
+    image: grafana/loki:2.9.0
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    volumes:
+      - ./monitoring/promtail.yml:/etc/promtail/config.yml
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    depends_on:
+      - prometheus
+      - loki
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+
+volumes:
+  grafana-data:
+```
+
+### Run it
+```bash
+# Build and start everything
+docker compose up --build
+
+# Test the services manually
+curl http://localhost:5000/users/1     # Should return user + orders
+curl http://localhost:5000/users/2
+curl http://localhost:5000/health
+
+# Hit order-service directly a few times — watch 20% fail
+for i in {1..10}; do curl -s http://localhost:5001/orders/1 | python3 -m json.tool; done
+
+# Check metrics are being exposed
+curl http://localhost:5000/metrics
+curl http://localhost:5001/metrics
+```
+
+---
+
+## Phase 3 — Monitoring Config Files
+
+### monitoring/prometheus.yml
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - "alert-rules.yml"
+
+scrape_configs:
+  - job_name: 'user-service'
+    static_configs:
+      - targets: ['user-service:5000']
+    metrics_path: /metrics
+
+  - job_name: 'order-service'
+    static_configs:
+      - targets: ['order-service:5001']
+    metrics_path: /metrics
+
+  - job_name: 'notification-service'
+    static_configs:
+      - targets: ['notification-service:5002']
+    metrics_path: /metrics
+```
+
+---
+
+### monitoring/alert-rules.yml
+```yaml
+groups:
+  - name: service_health
+    interval: 30s
+    rules:
+
+      # Alert if any service goes completely down
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🔴 Service {{ $labels.job }} is DOWN"
+          description: "{{ $labels.job }} has been unreachable for over 1 minute."
+
+      # Alert if order-service error rate spikes
+      - alert: HighOrderServiceErrorRate
+        expr: rate(order_service_errors_total[2m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ High error rate in order-service"
+          description: "order-service is seeing {{ printf \"%.2f\" $value }} errors/sec over the last 2 minutes."
+
+      # Alert if response time is too slow
+      - alert: SlowResponseTime
+        expr: histogram_quantile(0.95, rate(order_service_request_duration_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "🐢 order-service p95 latency > 1s"
+          description: "95th percentile response time is {{ printf \"%.2f\" $value }}s."
+```
+
+---
+
+### monitoring/alertmanager.yml
+```yaml
+global:
+  resolve_timeout: 5m
+  # Paste your Slack Incoming Webhook URL below
+  slack_api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h
+  receiver: 'slack-alerts'
+
+receivers:
+  - name: 'slack-alerts'
+    slack_configs:
+      - channel: '#devops-alerts'
+        send_resolved: true
+        title: '{{ if eq .Status "firing" }}🚨{{ else }}✅{{ end }} {{ .CommonAnnotations.summary }}'
+        text: |
+          *Severity:* {{ .CommonLabels.severity }}
+          *Detail:* {{ .CommonAnnotations.description }}
+          *Time:* {{ .CommonLabels.instance }}
+```
+
+---
+
+### monitoring/promtail.yml
+```yaml
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker-containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+```
+
+---
+
+### monitoring/grafana/datasources.yml
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: "15s"
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      maxLines: 1000
+```
+
+---
+
+## Phase 4 — Grafana Dashboard Setup
+
+1. Open `http://localhost:3000` — login with `admin` / `admin123`
+2. Go to **Connections → Data sources** — confirm Prometheus and Loki are green
+3. Import a pre-built community dashboard:
+   - Click **Dashboards → Import**
+   - Enter dashboard ID **`1860`** (Node Exporter Full) → Load
+   - For a Flask-specific view, create a custom dashboard with these panels:
+
+**Panel 1 — Request Rate (PromQL)**
+```
+rate(order_service_requests_total[1m])
+```
+
+**Panel 2 — Error Rate (PromQL)**
+```
+rate(order_service_errors_total[1m])
+```
+
+**Panel 3 — p95 Latency (PromQL)**
+```
+histogram_quantile(0.95, rate(order_service_request_duration_seconds_bucket[5m]))
+```
+
+**Panel 4 — Logs from order-service (LogQL in Loki)**
+```
+{container="order-service"} |= "ERROR"
+```
+
+---
+
+## Phase 5 — GitHub Actions CI/CD Pipeline
+
+### Setup GitHub Secrets
+
+In your GitHub repo → **Settings → Secrets → Actions**, add:
+
+| Secret Name | Value |
+|---|---|
+| `DOCKERHUB_USERNAME` | Your DockerHub username |
+| `DOCKERHUB_TOKEN` | DockerHub access token (not password) |
+
+### .github/workflows/deploy.yml
+```yaml
+name: CI — Build & Push Docker Images
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - name: user-service
+            port: 5000
+          - name: order-service
+            port: 5001
+          - name: notification-service
+            port: 5002
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.service.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/${{ matrix.service.name }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.service.name }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.service.name }}:${{ github.sha }}
+
+  # Optional health check after build
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start services with compose
+        run: docker compose up -d --build
+      - name: Wait for services to be healthy
+        run: sleep 15
+      - name: Health check all services
+        run: |
+          curl --fail http://localhost:5000/health
+          curl --fail http://localhost:5001/health
+          curl --fail http://localhost:5002/health
+      - name: Teardown
+        run: docker compose down
+```
+
+---
+
+## Phase 6 — Deploy to Kubernetes (minikube)
+
+### Start minikube
+```bash
+minikube start --cpus=4 --memory=8192
+minikube addons enable metrics-server
+```
+
+### k8s/user-service.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  labels:
+    app: user-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: user-service
+          image: YOUR_DOCKERHUB_USERNAME/user-service:latest
+          ports:
+            - containerPort: 5000
+          env:
+            - name: ORDER_SERVICE_URL
+              value: "http://order-service:5001"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+spec:
+  selector:
+    app: user-service
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP
+```
+
+Create similar files for `order-service.yaml` and `notification-service.yaml` — same pattern, just change names, ports, and image names.
+
+### Deploy to minikube
+```bash
+# Replace YOUR_DOCKERHUB_USERNAME in the yaml files first
+kubectl apply -f k8s/user-service.yaml
+kubectl apply -f k8s/order-service.yaml
+kubectl apply -f k8s/notification-service.yaml
+
+# Check everything is running
+kubectl get pods
+kubectl get services
+
+# Forward a port to test locally
+kubectl port-forward service/user-service 5000:5000
+
+# Test it
+curl http://localhost:5000/users/1
+```
+
+---
+
+## Phase 7 — Deploy Observability Stack to Kubernetes via Helm
+
+```bash
+# Add Helm repos
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+
+# Install Prometheus + Alertmanager (kube-prometheus-stack includes everything)
+helm install prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace \
+  --set grafana.adminPassword=admin123
+
+# Install Loki + Promtail
+helm install loki grafana/loki-stack \
+  --namespace monitoring \
+  --set promtail.enabled=true \
+  --set loki.persistence.enabled=false
+
+# Verify everything is running
+kubectl get pods -n monitoring
+```
+
+### Access Grafana in Kubernetes
+```bash
+kubectl port-forward -n monitoring service/prometheus-grafana 3000:80
+# Open http://localhost:3000 — admin / admin123
+```
+
+---
+
+## Phase 8 — Load Test + Watch Everything React
+
+### tests/load-test.js
+```javascript
+import http from 'k6/http';
+import { sleep, check } from 'k6';
+
+export let options = {
+  stages: [
+    { duration: '30s', target: 10  },  // Ramp up to 10 users
+    { duration: '1m',  target: 50  },  // Hold at 50 users — this will trigger errors
+    { duration: '30s', target: 100 },  // Spike to 100 users
+    { duration: '30s', target: 0   },  // Ramp down
+  ],
+};
+
+const BASE_URL = 'http://localhost:5000';
+
+export default function () {
+  const userId = Math.ceil(Math.random() * 3); // Users 1, 2, or 3
+
+  const res = http.get(`${BASE_URL}/users/${userId}`);
+
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'response time < 500ms': (r) => r.timings.duration < 500,
+  });
+
+  sleep(0.5);
+}
+```
+
+### Run the load test
+```bash
+# Make sure docker compose is running first
+k6 run tests/load-test.js
+```
+
+### What you should see in Grafana while k6 runs:
+- Request rate climbing in the metrics panel
+- Error rate panel showing the 20% failure hitting ~10 errors/sec
+- Loki logs filling up with `ERROR DB_TIMEOUT` messages
+- Within 2 minutes: Slack alert fires — "⚠️ High error rate in order-service"
+
+---
+
+## Slack Webhook Setup (for Alerts)
+
+1. Go to **api.slack.com/apps** → Create new app → From scratch
+2. **Incoming Webhooks** → Activate → Add to Workspace → Pick `#devops-alerts` channel
+3. Copy the Webhook URL
+4. Paste it into `monitoring/alertmanager.yml` where it says `YOUR/SLACK/WEBHOOK`
+5. Restart alertmanager: `docker compose restart alertmanager`
+
+---
+
+## Checklist — What "Done" Looks Like
+
+- [ ] All 3 services return data at `/health` and `/metrics`
+- [ ] Docker Compose brings up all 7 containers cleanly
+- [ ] Prometheus UI (`localhost:9090`) shows all 3 targets as **UP**
+- [ ] Grafana shows real-time request rate and error rate graphs
+- [ ] Loki shows searchable logs from all 3 services in Grafana Explore
+- [ ] GitHub Actions builds and pushes images on every push to `main`
+- [ ] All 3 services are running in Kubernetes via `kubectl get pods`
+- [ ] k6 load test runs and Grafana dashboard reacts in real time
+- [ ] Slack alert fires within 2 minutes of load test starting
+
+---
+
+## The Demo Script (for interviews / portfolio)
+
+> **Setup:** Have Grafana open on one half of your screen, terminal on the other.
+
+1. Show the 3 running pods: `kubectl get pods`
+2. Curl `user-service` — show a successful response
+3. Start the k6 load test
+4. Point at Grafana: "Watch the error rate climb — that's the 20% failure in order-service"
+5. Wait 2 minutes — show the Slack alert landing
+6. Open Loki in Grafana Explore — filter by `{container="order-service"} |= "ERROR"`
+7. Say: *"In a real incident, this is how I'd go from alert → the exact log line in under 30 seconds"*
+8. Fix the bug: change `0.2` to `0.0` in order-service, push to GitHub
+9. GitHub Actions builds and deploys automatically
+10. Grafana goes green. Slack sends a resolve notification.
+
+---
+
+## Key Concepts You'll Learn Building This
+
+| Concept | Where you learn it |
+|---|---|
+| The difference between metrics, logs, and traces | Using Prometheus vs Loki side by side |
+| Why Kubernetes health probes matter | When order-service crashes and k8s restarts it |
+| How alerting pipelines work | Writing PromQL alert rules + Alertmanager routing |
+| Why companies use Helm | Installing the entire observability stack in 3 commands |
+| What "observability" actually means | The moment Grafana tells you exactly what broke before you even knew |
+| GitOps basics | GitHub Actions deploying on push without you touching a server |
+
+---
+
+*Total estimated build time: 3–5 days for someone new to these tools, working a few hours each day.*
