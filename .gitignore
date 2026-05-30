@@ -1,3 +1,8 @@
 info.txt
+<<<<<<< HEAD
 info_file.txt
 .env
+=======
+info_file.txt
+.env
+>>>>>>> services_buildup
