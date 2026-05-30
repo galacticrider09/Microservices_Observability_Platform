@@ -73,13 +73,22 @@ services:
     depends_on:
       - prometheus
       - loki
-
-  alertmanager:
-    image: prom/alertmanager:latest
+  sns-forwarder:
+    build: ./services/sns-forwarder
     ports:
-      - "9093:9093"
-    volumes:
-      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - "5010:5010"
+    environment:
+      - AWS_REGION=ap-south-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - SNS_TOPIC_ARN=${SNS_TOPIC_ARN}
+
+  # alertmanager:
+  #   image: prom/alertmanager:latest
+  #   ports:
+  #     - "9093:9093"
+  #   volumes:
+  #     - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
 
 volumes:
   grafana-data:
