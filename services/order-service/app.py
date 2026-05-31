@@ -9,7 +9,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ----------- Prometheus Metrics -----------
 REQUEST_COUNT = Counter(
     'order_service_requests_total',
     'Total HTTP requests',
@@ -33,7 +32,6 @@ ORDERS = {
 
 NOTIF_SERVICE_URL = os.getenv("NOTIF_SERVICE_URL", "http://notification-service:5002")
 
-# ----------- Routes -----------
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy", "service": "order-service"})
@@ -47,7 +45,7 @@ def get_orders(user_id):
     start = time.time()
     logger.info(f"Fetching orders for user_id={user_id}")
 
-    # ⚡ THE VILLAIN — 20% intentional failure rate
+    # 20% intentional failure rate
     # This is what Prometheus will catch and alert on
     if random.random() < 0.2:
         ERROR_COUNTER.inc()
@@ -56,12 +54,12 @@ def get_orders(user_id):
         logger.error(f"DB_TIMEOUT: Failed to fetch orders for user_id={user_id} — simulated database timeout")
         return jsonify({"error": "Database timeout — please retry"}), 500
 
-    # Simulate realistic DB query time
+
     time.sleep(random.uniform(0.05, 0.3))
 
     orders = ORDERS.get(user_id, [])
 
-    # Fire-and-forget notification
+
     try:
         requests.post(
             f"{NOTIF_SERVICE_URL}/notify",
