@@ -47,7 +47,6 @@ Prometheus collects metrics
 Grafana displays dashboards  
 
 Logs flow into Loki 
-Tracing data goes through Jaeger
 
 ---
 
