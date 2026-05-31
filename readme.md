@@ -32,8 +32,7 @@ This setup tries to solve that by bringing everything into one place:
 - Docker
 - Prometheus
 - Grafana
-- Loki / ELK (for logs)
-- Jaeger / OpenTelemetry (for tracing)
+- Loki (for logs)
 - Node.js / Python (for microservices)
 - AWS EC2 (for deployment)
 
@@ -47,7 +46,7 @@ Prometheus collects metrics
 ↓  
 Grafana displays dashboards  
 
-Logs flow into Loki / ELK  
+Logs flow into Loki 
 Tracing data goes through Jaeger
 
 ---
