@@ -1,6 +1,6 @@
 # Microservices Observability Platform
 
-This project is a simple observability setup built around a microservices architecture.  
+This project is a observability setup built around a microservices architecture.  
 It helps in tracking logs, metrics, and request flows across multiple services so that debugging and monitoring become easier in a distributed system.
 
 ---
